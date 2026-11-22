@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Construction Site — Physics Animation</title>
+<style>
+  :root{
+    --ink:#1d2430; --panel:rgba(255,255,255,.93); --accent:#d9822b; --muted:#5b6575;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){ --ink:#e8edf3; --panel:rgba(18,22,28,.88); --muted:#9aa6b5; }
+  }
+  :root[data-theme="dark"]{ --ink:#e8edf3; --panel:rgba(18,22,28,.88); --muted:#9aa6b5; }
+  html,body{margin:0;height:100%;background:#a9cde3;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  #app{position:fixed;inset:0}
+  #app canvas{display:block}
+  #hud{position:absolute;left:16px;top:16px;width:min(340px,calc(100vw - 32px));background:var(--panel);color:var(--ink);
+       padding:14px 16px;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.22);font-size:14px;line-height:1.4;box-sizing:border-box}
+  #hud h1{font-size:16px;margin:0 0 8px}
+  #phase{margin:0 0 8px;font-weight:600;color:var(--accent);min-height:2.8em}
+  #stats{color:var(--muted);font-variant-numeric:tabular-nums;margin-bottom:10px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button,select{font:inherit;border-radius:8px;border:1px solid #c9d1dc;background:#fff;color:#1d2430;padding:6px 10px;cursor:pointer}
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) button,:root:not([data-theme="light"]) select{background:#222a35;color:#e8edf3;border-color:#3a4555} }
+  button:hover,select:hover{border-color:var(--accent)}
+  .note{margin:10px 0 0;color:var(--muted);font-size:12px}
+  #hint{position:absolute;right:16px;bottom:14px;color:#fff;background:rgba(0,0,0,.45);padding:6px 10px;border-radius:8px;font-size:12px}
+  @media (max-width:520px){ #hint{display:none} #hud{font-size:13px} }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/",
+    "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="hud">
+  <h1>Construction site — physics simulation</h1>
+  <p id="phase">Starting…</p>
+  <div id="stats"></div>
+  <div class="row">
+    <button id="btnPause" type="button">Pause</button>
+    <button id="btnReset" type="button">Reset</button>
+    <select id="speed" aria-label="Simulation speed">
+      <option value="0.25">0.25×</option>
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+    </select>
+  </div>
+  <p class="note">Bricks, the steel beam and the columns are real rigid bodies (gravity, friction, contact, bounce, sleep) simulated with cannon-es. The beam hangs from a distance constraint, so it swings like a pendulum when the trolley moves. Workers are animated figures and do not collide with the physics world.</p>
+</div>
+<div id="hint">Drag to orbit · Scroll to zoom · Space to pause</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import * as CANNON from 'cannon-es';
+
+// ---------------------------------------------------------------- constants
+const H = 1 / 120;            // fixed physics step (s)
+const CYCLE = 50;             // length of one build cycle (s)
+const NB = 36;                // bricks in the wall (6 courses x 6)
+const NW = 7;                 // workers
+const RELEASE_OFF = 3.5;      // seconds from a worker's task start to brick release
+const TASK_LEN = 5.5;         // length of one worker task
+const PICK_Z = 2.0;           // workers stand here to pick bricks
+const SPOT_Z = 0.85;          // workers stand here to place bricks
+const CRANE = { x: -9, z: -6, boomY: 12.1 };
+const LOAD_START_X = -2, DROP_X = 3.6;
+const BEAM_RELEASE_T = 10.5;
+
+const T_BRICK = k => 13 + k * 0.9;                 // release time of brick k (cycle time)
+// Stack layout: 6 bricks per course, 2 cm joints, courses stagger by 10 cm.
+// Tested in headless physics: this stays put, while a half-brick stagger lets end bricks tip off.
+const brickXY = k => {
+  const c = Math.floor(k / 6), i = k % 6;
+  return { x: -1.05 + i * 0.42 + (c % 2) * 0.1, y: 0.1 + c * 0.2 };
+};
+const pickX = w => 3.7 + (w % 3) * 0.5;
+const spotFor = k => new THREE.Vector3(brickXY(k).x, 0, SPOT_Z);
+const pickPos = w => new THREE.Vector3(pickX(w), 0, PICK_Z);
+
+// ---------------------------------------------------------------- helpers
+const ss = x => { x = Math.min(Math.max(x, 0), 1); return x * x * (3 - 2 * x); };
+const lerp = (a, b, k) => a + (b - a) * k;
+const lerpAngle = (a, b, k) => {
+  const d = ((b - a + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+  return a + d * k;
+};
+const UP = new THREE.Vector3(0, 1, 0);
+const cylCache = {};
+const cylGeo = r => (cylCache[r] ??= new THREE.CylinderGeometry(r, r, 1, 8));
+function link(a, b, r, mat) {
+  const m = new THREE.Mesh(cylGeo(r), mat);
+  m.castShadow = true;
+  scene.add(m);
+  setLink(m, a, b);
+  return m;
+}
+function setLink(m, a, b) {
+  const d = new THREE.Vector3().subVectors(b, a);
+  const len = d.length();
+  if (len < 1e-4) { m.visible = false; return; }
+  m.visible = true;
+  m.position.copy(a).addScaledVector(d, 0.5);
+  m.quaternion.setFromUnitVectors(UP, d.multiplyScalar(1 / len));
+  m.scale.set(1, len, 1);
+}
+
+// ---------------------------------------------------------------- renderer / scene
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xa9cde3);
+scene.fog = new THREE.Fog(0xa9cde3, 70, 180);
+
+const camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 400);
+camera.position.set(19, 10, 21);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 3.2, -2);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.485;
+controls.minDistance = 5;
+controls.maxDistance = 90;
+
+scene.add(new THREE.HemisphereLight(0xdfeeff, 0x6b6456, 0.95));
+const sun = new THREE.DirectionalLight(0xfff1d6, 2.4);
+sun.position.set(-22, 32, 16);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -30, right: 30, top: 30, bottom: -30, near: 1, far: 110 });
+sun.shadow.bias = -0.0004;
+scene.add(sun);
+
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x938b7c, roughness: 1 });
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(220, 220), groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// materials
+const M = {
+  concrete: new THREE.MeshStandardMaterial({ color: 0xc4bfb4, roughness: 0.95 }),
+  steel:    new THREE.MeshStandardMaterial({ color: 0x6b7787, roughness: 0.35, metalness: 0.75 }),
+  crane:    new THREE.MeshStandardMaterial({ color: 0xf0b429, roughness: 0.5, metalness: 0.2 }),
+  craneDk:  new THREE.MeshStandardMaterial({ color: 0x3a3f47, roughness: 0.6, metalness: 0.4 }),
+  wood:     new THREE.MeshStandardMaterial({ color: 0xa0764a, roughness: 0.9 }),
+  cable:    new THREE.MeshStandardMaterial({ color: 0x1d1f23, roughness: 0.8 }),
+  skin:     new THREE.MeshStandardMaterial({ color: 0xc68a5b, roughness: 0.7 }),
+  pants:    new THREE.MeshStandardMaterial({ color: 0x34405a, roughness: 0.9 }),
+  boot:     new THREE.MeshStandardMaterial({ color: 0x1b1b1b, roughness: 0.8 }),
+  hat:      new THREE.MeshStandardMaterial({ color: 0xffd600, roughness: 0.4 }),
+  vest:     new THREE.MeshStandardMaterial({ color: 0xd4ff3a, emissive: 0x1d2a00, roughness: 0.6 }),
+};
+const brickGeo = new THREE.BoxGeometry(0.4, 0.2, 0.2);
+const SET_DY = 0.06;   // workers set each brick down just above its seat
+const brickBase = new THREE.Color(0xb5533c);
+const brickMats = new Array(NB);
+const brickMat = k => (brickMats[k] ??= new THREE.MeshStandardMaterial({
+  color: brickBase.clone().offsetHSL(0, 0, (Math.random() - 0.5) * 0.08), roughness: 0.9
+}));
+
+// ---------------------------------------------------------------- physics world
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.allowSleep = true;
+world.solver.iterations = 20;
+world.defaultContactMaterial.friction = 0.8;
+world.defaultContactMaterial.restitution = 0.02;
+
+const groundBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
+groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+world.addBody(groundBody);
+
+// static scenery: columns and a beam (visual + physical)
+function staticBox(sx, sy, sz, x, y, z, material) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), material);
+  mesh.position.set(x, y, z);
+  mesh.castShadow = mesh.receiveShadow = true;
+  scene.add(mesh);
+  world.addBody(new CANNON.Body({
+    mass: 0,
+    shape: new CANNON.Box(new CANNON.Vec3(sx / 2, sy / 2, sz / 2)),
+    position: new CANNON.Vec3(x, y, z),
+  }));
+}
+for (const x of [-5.5, 5.5]) for (const z of [-5, 1]) staticBox(0.6, 4, 0.6, x, 2, z, M.concrete);
+staticBox(11, 0.4, 0.4, 0, 4, -5, M.steel);
+staticBox(11, 0.4, 0.4, 0, 4, 1, M.steel);
+
+// pallet of bricks (visual only; bricks are picked from here)
+const pallet = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.12, 1.0), M.wood);
+pallet.position.set(4.2, 0.06, 3.0); pallet.castShadow = pallet.receiveShadow = true; scene.add(pallet);
+for (let layer = 0; layer < 4; layer++)
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) {
+    const b = new THREE.Mesh(brickGeo, brickMat(0));
+    b.position.set(4.2 + (i - 1) * 0.42, 0.12 + 0.1 + layer * 0.2, 2.75 + j * 0.5);
+    b.castShadow = b.receiveShadow = true; scene.add(b);
+  }
+
+// ---------------------------------------------------------------- crane
+const crane = new THREE.Group(); scene.add(crane);
+{
+  const { x, z } = CRANE;
+  const corners = [[x - 0.6, z - 0.6], [x + 0.6, z - 0.6], [x + 0.6, z + 0.6], [x - 0.6, z + 0.6]];
+  corners.forEach(([cx, cz]) => link(new THREE.Vector3(cx, 0, cz), new THREE.Vector3(cx, 12, cz), 0.06, M.crane));
+  for (const y of [3, 6, 9, 12]) for (let i = 0; i < 4; i++) {
+    const [ax, az] = corners[i], [bx, bz] = corners[(i + 1) % 4];
+    link(new THREE.Vector3(ax, y, az), new THREE.Vector3(bx, y, bz), 0.04, M.crane);
+  }
+  const boom = new THREE.Mesh(new THREE.BoxGeometry(17.5, 0.6, 0.7), M.crane);
+  boom.position.set(-0.25, CRANE.boomY, z); boom.castShadow = true; scene.add(boom);
+  const cw = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.8, 1.4), M.craneDk);
+  cw.position.set(x - 1.8, CRANE.boomY - 0.2, z); cw.castShadow = true; scene.add(cw);
+}
+const trolley = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.5, 0.9), M.craneDk);
+trolley.castShadow = true; scene.add(trolley);
+const hoistLine = link(new THREE.Vector3(), new THREE.Vector3(), 0.03, M.cable);
+const slingA = link(new THREE.Vector3(), new THREE.Vector3(), 0.02, M.cable);
+const slingB = link(new THREE.Vector3(), new THREE.Vector3(), 0.02, M.cable);
+
+// ---------------------------------------------------------------- workers
+const SHIRTS = [0xe65100, 0x1e88e5, 0x43a047, 0xf9a825, 0x8e24aa, 0x00838f, 0xd84315];
+function mkBox(w, h, d, m) { const x = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); x.castShadow = true; return x; }
+function at(parent, obj, x, y, z) { obj.position.set(x, y, z); parent.add(obj); return obj; }
+function group(parent, x, y, z) { const g = new THREE.Group(); g.position.set(x, y, z); parent.add(g); return g; }
+
+function makeWorker(shirtColor) {
+  const shirt = new THREE.MeshStandardMaterial({ color: shirtColor, roughness: 0.8 });
+  const root = new THREE.Group(); scene.add(root);
+
+  // legs: hip -> knee -> boot
+  const legL = group(root, -0.12, 0.85, 0), legR = group(root, 0.12, 0.85, 0);
+  const kneeL = group(legL, 0, -0.42, 0), kneeR = group(legR, 0, -0.42, 0);
+  at(legL, mkBox(0.16, 0.42, 0.18, M.pants), 0, -0.21, 0);
+  at(legR, mkBox(0.16, 0.42, 0.18, M.pants), 0, -0.21, 0);
+  at(kneeL, mkBox(0.15, 0.42, 0.16, M.pants), 0, -0.21, 0);
+  at(kneeR, mkBox(0.15, 0.42, 0.16, M.pants), 0, -0.21, 0);
+  at(kneeL, mkBox(0.17, 0.1, 0.27, M.boot), 0, -0.44, 0.04);
+  at(kneeR, mkBox(0.17, 0.1, 0.27, M.boot), 0, -0.44, 0.04);
+
+  // torso (pivots at the hips)
+  const torso = group(root, 0, 0.85, 0);
+  at(torso, mkBox(0.44, 0.6, 0.26, shirt), 0, 0.3, 0);
+  at(torso, mkBox(0.46, 0.08, 0.275, M.vest), 0, 0.38, 0);
+  at(torso, mkBox(0.46, 0.08, 0.275, M.vest), 0, 0.2, 0);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.12, 16, 12), M.skin);
+  at(torso, head, 0, 0.78, 0); head.castShadow = true;
+  const hat = new THREE.Mesh(new THREE.SphereGeometry(0.15, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2), M.hat);
+  at(torso, hat, 0, 0.8, 0); hat.castShadow = true;
+
+  // arms: shoulder -> elbow -> hand
+  const shL = group(torso, -0.28, 0.56, 0), shR = group(torso, 0.28, 0.56, 0);
+  const elL = group(shL, 0, -0.5, 0), elR = group(shR, 0, -0.5, 0);
+  at(shL, mkBox(0.14, 0.5, 0.14, shirt), 0, -0.25, 0);
+  at(shR, mkBox(0.14, 0.5, 0.14, shirt), 0, -0.25, 0);
+  at(elL, mkBox(0.13, 0.45, 0.13, shirt), 0, -0.22, 0);
+  at(elR, mkBox(0.13, 0.45, 0.13, shirt), 0, -0.22, 0);
+  at(elL, new THREE.Mesh(new THREE.SphereGeometry(0.065, 10, 8), M.skin), 0, -0.46, 0);
+  at(elR, new THREE.Mesh(new THREE.SphereGeometry(0.065, 10, 8), M.skin), 0, -0.46, 0);
+
+  return {
+    root, legL, legR, kneeL, kneeR, torso, shL, shR, elL, elR,
+    pose: { ...POSES.idle }, heading: 0, carried: null,
+  };
+}
+
+const POSES = {
+  idle:  { torso: 0.02, armL: 0.05, armR: 0.05, armSwing: 0, legAmp: 0,    knee: 0,   rootY: 0 },
+  walk:  { torso: 0.05, armL: 0,    armR: 0,    armSwing: 1, legAmp: 1,    knee: 0,   rootY: 0 },
+  carry: { torso: 0.08, armL: -0.9, armR: -0.9, armSwing: 0, legAmp: 1,    knee: 0,   rootY: 0 },
+  pick:  { torso: 0.75, armL: -0.6, armR: -0.6, armSwing: 0, legAmp: 0.15, knee: 0.7, rootY: -0.28 },
+  place: { torso: 0.2,  armL: -1.25, armR: -1.5, armSwing: 0, legAmp: 0,   knee: 0,   rootY: 0 },
+};
+
+const workers = [];
+for (let w = 0; w < NW; w++) workers.push(makeWorker(SHIRTS[w]));
+
+function applyPose(wk, lt) {
+  const p = wk.pose;
+  const s = Math.sin(lt * Math.PI * 2 * 1.2);
+  wk.legL.rotation.x = -s * 0.45 * p.legAmp;
+  wk.legR.rotation.x = s * 0.45 * p.legAmp;
+  wk.kneeL.rotation.x = p.knee + 0.7 * p.legAmp * Math.max(0, s);
+  wk.kneeR.rotation.x = p.knee + 0.7 * p.legAmp * Math.max(0, -s);
+  wk.torso.rotation.x = p.torso;
+  wk.shL.rotation.x = p.armL + s * 0.4 * p.armSwing;
+  wk.shR.rotation.x = p.armR - s * 0.4 * p.armSwing;
+  wk.elL.rotation.x = -0.25;
+  wk.elR.rotation.x = -0.25;
+  wk.root.position.y = p.rootY;
+}
+function stepPose(wk, target, dt) {
+  const k = 1 - Math.exp(-dt * 8);
+  for (const key in target) wk.pose[key] = lerp(wk.pose[key], target[key], k);
+}
+function activeTask(w, t) {
+  for (let k = w; k < NB; k += NW) {
+    const lt = t - (T_BRICK(k) - RELEASE_OFF);
+    if (lt >= 0 && lt < TASK_LEN) return { k, lt };
+  }
+  return null;
+}
+const chestLocal = new THREE.Vector3(0, 1.1, 0.3);
+const handLocal = new THREE.Vector3(0.22, 1.0, 0.45);
+
+function workerFrame(dt) {
+  for (let w = 0; w < NW; w++) {
+    const wk = workers[w];
+    const info = activeTask(w, cycleT);
+    const pick = pickPos(w);
+    let pos = pick, heading = 0, target = POSES.idle, lt = 0, carry = null;
+
+    if (info) {
+      const { k } = info; lt = info.lt;
+      const S = spotFor(k);
+      if (lt < 1.0) {
+        target = POSES.pick;
+      } else if (lt < 3.0) {
+        const u = ss((lt - 1) / 2);
+        pos = pick.clone().lerp(S, u);
+        heading = Math.atan2(S.x - pick.x, S.z - pick.z);
+        target = POSES.carry;
+        carry = 'chest';
+      } else if (lt < RELEASE_OFF) {
+        pos = S;
+        heading = Math.PI;
+        target = POSES.place;
+        carry = 'hand';
+      } else {
+        const u = ss((lt - RELEASE_OFF) / 2);
+        pos = S.clone().lerp(pick, u);
+        heading = Math.atan2(pick.x - S.x, pick.z - S.z);
+        target = POSES.walk;
+      }
+    }
+
+    stepPose(wk, target, dt);
+    wk.heading = lerpAngle(wk.heading, heading, 1 - Math.exp(-dt * 10));
+    wk.root.position.x = pos.x;
+    wk.root.position.z = pos.z;
+    wk.root.rotation.y = wk.heading;
+    applyPose(wk, lt);
+    wk.root.updateMatrixWorld(true);
+
+    // brick carried in the worker's hands
+    if (carry) {
+      const k = info.k;
+      if (!wk.carried) {
+        wk.carried = new THREE.Mesh(brickGeo, brickMat(k));
+        wk.carried.castShadow = true;
+        scene.add(wk.carried);
+      }
+      if (carry === 'chest') {
+        wk.carried.position.copy(wk.root.localToWorld(chestLocal.clone()));
+      } else {
+        const hw = wk.root.localToWorld(handLocal.clone());
+        const { x, y } = brickXY(k);
+        const sp = new THREE.Vector3(x, y + SET_DY, 0);
+        wk.carried.position.copy(hw.lerp(sp, ss((lt - 3.0) / 0.5)));
+      }
+      wk.carried.quaternion.copy(wk.root.quaternion);
+    } else if (wk.carried) {
+      scene.remove(wk.carried);
+      wk.carried = null;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- simulation state
+let simT = 0, cycleStart = 0, cycleT = 0;
+let beamBody = null, beamMesh = null, anchor = null, beamCons = null;
+let released = false;
+let prevHook = { x: LOAD_START_X, y: 6.15 };
+const dyn = [];                    // {body, mesh} for every physical brick
+const spawned = new Array(NB).fill(false);
+
+function craneAt(t) {
+  let y;
+  if (t < 2.5) y = lerp(6.15, 9.5, ss(t / 2.5));
+  else if (t < 6) y = 9.5;
+  else y = lerp(9.5, 6.5, ss((t - 6) / 4.5));
+  const x = lerp(LOAD_START_X, DROP_X, ss((t - 2.5) / 6.5));
+  return { x, y };
+}
+
+function spawnBrick(k) {
+  const { x, y } = brickXY(k);
+  const body = new CANNON.Body({
+    mass: 2.2,
+    shape: new CANNON.Box(new CANNON.Vec3(0.2, 0.1, 0.1)),
+    position: new CANNON.Vec3(x, y + SET_DY, 0),   // set down just above its course
+    linearDamping: 0.2,
+    angularDamping: 0.5,
+  });
+  body.allowSleep = true;
+  body.sleepSpeedLimit = 0.15;
+  body.sleepTimeLimit = 0.8;
+  world.addBody(body);
+  const mesh = new THREE.Mesh(brickGeo, brickMat(k));
+  mesh.castShadow = mesh.receiveShadow = true;
+  scene.add(mesh);
+  dyn.push({ body, mesh });
+  spawned[k] = true;
+}
+
+function resetCycle() {
+  for (const d of dyn) { world.removeBody(d.body); scene.remove(d.mesh); }
+  dyn.length = 0;
+  spawned.fill(false);
+  for (const wk of workers) if (wk.carried) { scene.remove(wk.carried); wk.carried = null; }
+  if (beamCons) { world.removeConstraint(beamCons); beamCons = null; }
+  if (beamBody) { world.removeBody(beamBody); scene.remove(beamMesh); }
+  released = false;
+
+  // steel beam on the ground, ready to be lifted
+  beamBody = new CANNON.Body({
+    mass: 350,
+    shape: new CANNON.Box(new CANNON.Vec3(1.2, 0.15, 0.25)),
+    position: new CANNON.Vec3(LOAD_START_X, 0.15, CRANE.z),
+    linearDamping: 0.05,
+    angularDamping: 0.1,
+  });
+  world.addBody(beamBody);
+  beamMesh = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.3, 0.5), M.steel);
+  beamMesh.castShadow = beamMesh.receiveShadow = true;
+  scene.add(beamMesh);
+
+  // hook point: kinematic, driven by the crane; the load hangs from it on a 6 m rope
+  if (!anchor) {
+    anchor = new CANNON.Body({ type: CANNON.Body.KINEMATIC, mass: 0 });
+    world.addBody(anchor);
+  }
+  anchor.position.set(LOAD_START_X, 6.15, CRANE.z);
+  anchor.velocity.set(0, 0, 0);
+  prevHook = { x: LOAD_START_X, y: 6.15 };
+  beamCons = new CANNON.DistanceConstraint(anchor, beamBody, 6.0);
+  world.addConstraint(beamCons);
+
+  for (const wk of workers) { wk.pose = { ...POSES.idle }; wk.heading = 0; }
+}
+
+function stepSim(h) {
+  simT += h;
+  cycleT = simT - cycleStart;
+  if (cycleT >= CYCLE) { cycleStart = simT; cycleT = 0; resetCycle(); }
+
+  // crane: move the hook with a velocity so the rope constraint sees real motion
+  const hook = craneAt(cycleT);
+  anchor.position.set(hook.x, hook.y, CRANE.z);
+  anchor.velocity.set((hook.x - prevHook.x) / h, (hook.y - prevHook.y) / h, 0);
+  prevHook = hook;
+
+  if (!released && cycleT >= BEAM_RELEASE_T) {
+    world.removeConstraint(beamCons);
+    beamCons = null;
+    released = true;
+  }
+  for (let k = 0; k < NB; k++) if (!spawned[k] && cycleT >= T_BRICK(k)) spawnBrick(k);
+
+  world.step(h);
+}
+
+// ---------------------------------------------------------------- visual sync
+function syncVisuals(dt) {
+  for (const d of dyn) {
+    d.mesh.position.set(d.body.position.x, d.body.position.y, d.body.position.z);
+    d.mesh.quaternion.set(d.body.quaternion.x, d.body.quaternion.y, d.body.quaternion.z, d.body.quaternion.w);
+  }
+  if (beamBody) {
+    beamMesh.position.set(beamBody.position.x, beamBody.position.y, beamBody.position.z);
+    beamMesh.quaternion.set(beamBody.quaternion.x, beamBody.quaternion.y, beamBody.quaternion.z, beamBody.quaternion.w);
+  }
+
+  // crane rigging
+  const hookPos = new THREE.Vector3(prevHook.x, prevHook.y, CRANE.z);
+  const trolleyPos = new THREE.Vector3(prevHook.x, CRANE.boomY - 0.05, CRANE.z);
+  trolley.position.copy(trolleyPos);
+  setLink(hoistLine, trolleyPos, hookPos);
+  const slingsOn = beamCons !== null && beamMesh;
+  slingA.visible = slingB.visible = !!slingsOn;
+  if (slingsOn) {
+    const q = beamMesh.quaternion;
+    const p1 = new THREE.Vector3(1.0, 0.15, 0).applyQuaternion(q).add(beamMesh.position);
+    const p2 = new THREE.Vector3(-1.0, 0.15, 0).applyQuaternion(q).add(beamMesh.position);
+    setLink(slingA, hookPos, p1);
+    setLink(slingB, hookPos, p2);
+  }
+
+  workerFrame(dt);
+}
+
+// ---------------------------------------------------------------- HUD
+const $phase = document.getElementById('phase');
+const $stats = document.getElementById('stats');
+function phaseText(t) {
+  if (t < 2.5) return 'Crane lifts the steel beam — rope tension and gravity act on the load';
+  if (t < 6) return 'Trolley moves — the load swings like a real pendulum';
+  if (t < BEAM_RELEASE_T) return 'Hook lowers the beam into position';
+  if (t < BEAM_RELEASE_T + 1.2) return 'Beam released — it falls, hits the ground and bounces';
+  if (t < T_BRICK(0)) return 'Bricklayers collect bricks from the pallet';
+  if (t < T_BRICK(NB - 1) + 1) return 'Bricklaying — each brick is a dynamic body (gravity, friction, contact)';
+  return 'Wall settled — resetting';
+}
+let lastPhase = '';
+function updateHUD() {
+  const txt = phaseText(cycleT);
+  if (txt !== lastPhase) { $phase.textContent = txt; lastPhase = txt; }
+  const placed = spawned.filter(Boolean).length;
+  const asleep = dyn.filter(d => d.body.sleepState === CANNON.Body.SLEEPING).length;
+  $stats.textContent = `Bricks placed: ${placed}/${NB} · settled (asleep): ${asleep} · cycle ${cycleT.toFixed(1)}s / ${CYCLE}s`;
+}
+
+// ---------------------------------------------------------------- controls
+let paused = false, speed = 1, acc = 0, last = performance.now();
+const $btnPause = document.getElementById('btnPause');
+const togglePause = () => { paused = !paused; $btnPause.textContent = paused ? 'Play' : 'Pause'; };
+$btnPause.addEventListener('click', togglePause);
+document.getElementById('btnReset').addEventListener('click', () => { cycleStart = simT; resetCycle(); });
+document.getElementById('speed').addEventListener('change', e => { speed = parseFloat(e.target.value); });
+addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); togglePause(); } });
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------------------------------------------------------------- main loop
+resetCycle();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  if (!paused) {
+    acc = Math.min(acc + dt * speed, 0.25);
+    while (acc >= H) { stepSim(H); acc -= H; }
+  }
+  syncVisuals(dt);
+  controls.update();
+  renderer.render(scene, camera);
+  updateHUD();
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
